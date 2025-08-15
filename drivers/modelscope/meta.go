@@ -10,8 +10,8 @@ const (
 )
 
 var config = driver.Config{
-	Name: DriverName,
-	OnlyProxy: true,
+	Name:      DriverName,
+	OnlyProxy: false,
 }
 
 type Addition struct {

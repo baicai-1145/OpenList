@@ -66,22 +66,28 @@ func (d *ModelScope) List(ctx context.Context, dir model.Obj, args model.ListArg
 		utils.Log.Errorf("modelscope list api response body: %s", string(resp.Body()))
 		return nil, err
 	}
-	
+
 	if !fileListResp.Success {
 		utils.Log.Errorf("modelscope list api logic error: %s (RequestId: %s)", fileListResp.Message, fileListResp.RequestId)
 		return nil, fmt.Errorf("modelscope api error: %s", fileListResp.Message)
 	}
-	
+
 	return filesToObjs(fileListResp.Data.Files), nil
 }
 
 func (d *ModelScope) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	apiURL := fmt.Sprintf("%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s",
 		API_ENDPOINT, d.ModelID, d.Revision, file.GetPath())
-	utils.Log.Infof("ModelScope Link API URL: %s", apiURL)
+	utils.Log.Infof("ModelScope Link API URL: %s, Redirect: %v", apiURL, args.Redirect)
 
-	// We need to resolve the redirect ourselves to get the final download URL.
-	// Disable redirect following for this specific client.
+	if !args.Redirect {
+		// Proxy mode
+		return &model.Link{
+			URL: apiURL,
+		}, nil
+	}
+
+	// Redirect mode
 	client := resty.New().SetRedirectPolicy(resty.NoRedirectPolicy())
 	resp, err := client.R().SetContext(ctx).Get(apiURL)
 
@@ -92,14 +98,12 @@ func (d *ModelScope) Link(ctx context.Context, file model.Obj, args model.LinkAr
 
 	var finalURL string
 	if resp.StatusCode() == http.StatusFound {
-		// Case 1: LFS file, we got a redirect.
 		finalURL = resp.Header().Get("Location")
 		if finalURL == "" {
 			utils.Log.Errorf("modelscope link api error: Location header not found in 302 redirect response")
 			return nil, fmt.Errorf("failed to get download link: Location header not found")
 		}
 	} else {
-		// Case 2: Normal file, the API URL itself is the download link.
 		finalURL = apiURL
 	}
 
