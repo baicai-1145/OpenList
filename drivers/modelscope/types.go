@@ -15,6 +15,7 @@ type FileListResponse struct {
 		Files []File `json:"Files"`
 	} `json:"Data"`
 	Success   bool   `json:"Success"`
+	Code      int    `json:"Code"`
 	Message   string `json:"Message"`
 	RequestID string `json:"RequestId"`
 }

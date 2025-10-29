@@ -17,8 +17,9 @@ var config = driver.Config{
 type Addition struct {
 	driver.RootPath
 	ModelID      string `json:"model_id" type:"string" required:"true"`
-	ResourceType string `json:"resource_type" type:"select" options:"model|dataset" default:"model"`
+	ResourceType string `json:"resource_type" type:"select" options:"model,dataset" default:"model"`
 	Revision     string `json:"revision" type:"string" required:"true" default:"master"`
+	DefaultRoot  string `json:"default_root" type:"string"`
 }
 
 func (a *Addition) GetRootPath() string {
