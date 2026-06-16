@@ -8,6 +8,7 @@ import (
 	neturl "net/url"
 	stdpath "path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -21,6 +22,7 @@ const (
 	apiEndpoint         = "https://www.modelscope.cn"
 	resourceTypeModel   = "model"
 	resourceTypeDataset = "dataset"
+	requestTimeout      = 30 * time.Second
 )
 
 type ModelScope struct {
@@ -38,7 +40,7 @@ func (d *ModelScope) GetAddition() driver.Additional {
 }
 
 func (d *ModelScope) Init(ctx context.Context) error {
-	d.client = resty.New()
+	d.client = resty.New().SetTimeout(requestTimeout)
 	d.ModelID = strings.TrimSpace(d.ModelID)
 	if d.ModelID == "" {
 		return fmt.Errorf("model_id is required")
@@ -71,161 +73,84 @@ func (d *ModelScope) List(ctx context.Context, dir model.Obj, args model.ListArg
 		}
 	}
 
-	// For datasets, prefer /repo/tree with Path parameter.
 	if d.ResourceType == resourceTypeDataset {
 		return d.listDatasetTree(ctx, path)
 	}
 
-	var lastErr error
-	segments := d.resourceSegmentsCandidates()
-	for _, seg := range segments {
-		for idx, revision := range d.revisionCandidates() {
-			// Try GET first
-			getURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/files?Revision=%s&Recursive=false&Root=%s", apiEndpoint, seg, d.ModelID, revision, path)
-			utils.Log.Infof("ModelScope List API URL: %s (GET try %d)", getURL, idx+1)
-			resp, err := d.client.R().SetContext(ctx).Get(getURL)
-			if err == nil && resp.StatusCode() == http.StatusOK {
-				var fileListResp FileListResponse
-				uerr := json.Unmarshal(resp.Body(), &fileListResp)
-				if uerr == nil && (fileListResp.Success || fileListResp.Code == 200) {
-					return filesToObjs(fileListResp.Data.Files), nil
-				}
-				if uerr != nil {
-					utils.Log.Errorf("modelscope list api unmarshal error: %+v", uerr)
-					utils.Log.Errorf("modelscope list api response body: %s", string(resp.Body()))
-					lastErr = uerr
-				} else if !fileListResp.Success && fileListResp.Code != 200 {
-					utils.Log.Errorf("modelscope list api logic error: %s (RequestId: %s, Code: %d)", fileListResp.Message, fileListResp.RequestID, fileListResp.Code)
-					lastErr = fmt.Errorf("modelscope api error: %s", fileListResp.Message)
-				}
-			} else if err != nil {
-				utils.Log.Errorf("modelscope list api request error: %+v", err)
-				lastErr = err
-			} else {
-				utils.Log.Errorf("modelscope list api response status error: %d, body: %s", resp.StatusCode(), string(resp.Body()))
-				lastErr = fmt.Errorf("failed to list files: status code %d", resp.StatusCode())
+	return d.tryAllCandidates(ctx, func(ctx context.Context, segment, revision string) ([]model.Obj, bool) {
+		getURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/files?Revision=%s&Recursive=false&Root=%s", apiEndpoint, segment, d.ModelID, revision, path)
+		resp, err := d.client.R().SetContext(ctx).Get(getURL)
+		if err == nil && resp.StatusCode() == http.StatusOK {
+			var filesResp FileListResponse
+			if uerr := json.Unmarshal(resp.Body(), &filesResp); uerr == nil && (filesResp.Success || filesResp.Code == 200) {
+				return filesToObjs(filesResp.Data.Files), true
 			}
-
-			// If GET not successful or returned 405/404, try POST fallback
-			if lastErr != nil {
-				status := 0
-				if resp != nil {
-					status = resp.StatusCode()
-				}
-				if status == http.StatusMethodNotAllowed || status == http.StatusNotFound {
-					postURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/files", apiEndpoint, seg, d.ModelID)
-					payload := map[string]interface{}{"Revision": revision, "Recursive": false, "Root": path}
-					utils.Log.Infof("ModelScope List API URL: %s (POST try %d)", postURL, idx+1)
-					resp2, err2 := d.client.R().SetHeader("Content-Type", "application/json").SetBody(payload).SetContext(ctx).Post(postURL)
-					if err2 == nil && resp2.StatusCode() == http.StatusOK {
-						var fileListResp2 FileListResponse
-						uerr := json.Unmarshal(resp2.Body(), &fileListResp2)
-						if uerr == nil && (fileListResp2.Success || fileListResp2.Code == 200) {
-							return filesToObjs(fileListResp2.Data.Files), nil
-						}
-						if uerr != nil {
-							utils.Log.Errorf("modelscope list api(unmarshal,post) error: %+v", uerr)
-							utils.Log.Errorf("modelscope list api(post) response body: %s", string(resp2.Body()))
-							lastErr = uerr
-						} else if !fileListResp2.Success && fileListResp2.Code != 200 {
-							utils.Log.Errorf("modelscope list api(post) logic error: %s (RequestId: %s, Code: %d)", fileListResp2.Message, fileListResp2.RequestID, fileListResp2.Code)
-							lastErr = fmt.Errorf("modelscope api error: %s", fileListResp2.Message)
-						}
-					} else if err2 != nil {
-						utils.Log.Errorf("modelscope list api(post) request error: %+v", err2)
-						lastErr = err2
-					} else {
-						utils.Log.Errorf("modelscope list api(post) status error: %d, body: %s", resp2.StatusCode(), string(resp2.Body()))
-						lastErr = fmt.Errorf("failed to list files(post): status code %d", resp2.StatusCode())
-					}
+		}
+		if resp != nil && (resp.StatusCode() == http.StatusMethodNotAllowed || resp.StatusCode() == http.StatusNotFound) {
+			postURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/files", apiEndpoint, segment, d.ModelID)
+			payload := map[string]interface{}{"Revision": revision, "Recursive": false, "Root": path}
+			resp2, err2 := d.client.R().SetHeader("Content-Type", "application/json").SetBody(payload).SetContext(ctx).Post(postURL)
+			if err2 == nil && resp2.StatusCode() == http.StatusOK {
+				var filesResp2 FileListResponse
+				if uerr := json.Unmarshal(resp2.Body(), &filesResp2); uerr == nil && (filesResp2.Success || filesResp2.Code == 200) {
+					return filesToObjs(filesResp2.Data.Files), true
 				}
 			}
 		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("modelscope list failed with all strategies")
-	}
-	return nil, lastErr
+		return nil, false
+	})
 }
 
 func (d *ModelScope) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	client := resty.New().SetRedirectPolicy(resty.NoRedirectPolicy())
-	var lastErr error
-	segments := d.resourceSegmentsCandidates()
-	// For datasets, build repo-relative file path by trimming driver root
 	filePath := file.GetPath()
 	if d.ResourceType == resourceTypeDataset {
 		filePath = d.repoRelativePath(filePath)
 	}
-	for _, seg := range segments {
-		for idx, revision := range d.revisionCandidates() {
-			encodedFilePath := neturl.QueryEscape(filePath)
-			apiURL := fmt.Sprintf("%s/api/v1/%s/%s/repo?Revision=%s&FilePath=%s", apiEndpoint, seg, d.ModelID, revision, encodedFilePath)
-			utils.Log.Infof("ModelScope Link API URL: %s, Redirect: %v (GET try %d)", apiURL, args.Redirect, idx+1)
 
-			resp, err := client.R().SetContext(ctx).Get(apiURL)
-			if err == nil || (resp != nil && resp.StatusCode() == http.StatusFound) {
-				switch resp.StatusCode() {
+	return d.tryAllLinkCandidates(ctx, func(ctx context.Context, segment, revision string) (*model.Link, bool) {
+		client := resty.New().SetRedirectPolicy(resty.NoRedirectPolicy()).SetTimeout(requestTimeout)
+		encodedFilePath := neturl.QueryEscape(filePath)
+		apiURL := fmt.Sprintf("%s/api/v1/%s/%s/repo?Revision=%s&FilePath=%s", apiEndpoint, segment, d.ModelID, revision, encodedFilePath)
+
+		resp, err := client.R().SetContext(ctx).Get(apiURL)
+		if err == nil && resp != nil {
+			switch resp.StatusCode() {
+			case http.StatusFound:
+				if finalURL := resp.Header().Get("Location"); finalURL != "" {
+					if args.Redirect {
+						return &model.Link{URL: finalURL}, true
+					}
+					return &model.Link{URL: apiURL}, true
+				}
+			case http.StatusOK:
+				return &model.Link{URL: apiURL}, true
+			}
+		}
+
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode()
+		}
+		if status == http.StatusMethodNotAllowed || status == http.StatusNotFound || err != nil {
+			postURL := fmt.Sprintf("%s/api/v1/%s/%s/repo", apiEndpoint, segment, d.ModelID)
+			payload := map[string]interface{}{"Revision": revision, "FilePath": filePath}
+			resp2, err2 := client.R().SetHeader("Content-Type", "application/json").SetBody(payload).SetContext(ctx).Post(postURL)
+			if err2 == nil && resp2 != nil {
+				switch resp2.StatusCode() {
 				case http.StatusFound:
-					finalURL := resp.Header().Get("Location")
-					if finalURL == "" {
-						utils.Log.Errorf("modelscope link api error: Location header not found in 302 redirect response")
-						lastErr = fmt.Errorf("failed to get download link: Location header not found")
-						// try POST fallback below
-					} else {
+					if finalURL := resp2.Header().Get("Location"); finalURL != "" {
 						if args.Redirect {
-							return &model.Link{URL: finalURL}, nil
+							return &model.Link{URL: finalURL}, true
 						}
-						return &model.Link{URL: apiURL}, nil
+						return &model.Link{URL: postURL}, true
 					}
 				case http.StatusOK:
-					return &model.Link{URL: apiURL}, nil
-				}
-			} else {
-				utils.Log.Errorf("modelscope link api request error: %+v", err)
-				lastErr = err
-			}
-
-			// POST fallback if GET not usable or 405/404
-			status := 0
-			if resp != nil {
-				status = resp.StatusCode()
-			}
-			if status == http.StatusMethodNotAllowed || status == http.StatusNotFound || lastErr != nil {
-				postURL := fmt.Sprintf("%s/api/v1/%s/%s/repo", apiEndpoint, seg, d.ModelID)
-				payload := map[string]interface{}{"Revision": revision, "FilePath": filePath}
-				utils.Log.Infof("ModelScope Link API URL: %s, Redirect: %v (POST try %d)", postURL, args.Redirect, idx+1)
-				resp2, err2 := client.R().SetHeader("Content-Type", "application/json").SetBody(payload).SetContext(ctx).Post(postURL)
-				if err2 == nil {
-					switch resp2.StatusCode() {
-					case http.StatusFound:
-						finalURL := resp2.Header().Get("Location")
-						if finalURL == "" {
-							utils.Log.Errorf("modelscope link api(post) error: Location header not found in 302 redirect response")
-							lastErr = fmt.Errorf("failed to get download link(post): Location header not found")
-						} else {
-							if args.Redirect {
-								return &model.Link{URL: finalURL}, nil
-							}
-							return &model.Link{URL: postURL}, nil
-						}
-					case http.StatusOK:
-						return &model.Link{URL: postURL}, nil
-					default:
-						utils.Log.Errorf("modelscope link api(post) response status error: %d", resp2.StatusCode())
-						lastErr = fmt.Errorf("failed to get download link(post): status code %d", resp2.StatusCode())
-					}
-				} else {
-					utils.Log.Errorf("modelscope link api(post) request error: %+v", err2)
-					lastErr = err2
+					return &model.Link{URL: postURL}, true
 				}
 			}
 		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("modelscope link failed with all strategies")
-	}
-	return nil, lastErr
+		return nil, false
+	})
 }
 
 func (d *ModelScope) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
@@ -305,9 +230,111 @@ func (d *ModelScope) revisionCandidates() []string {
 	return candidates
 }
 
-// listDatasetTree lists files for datasets using the /repo/tree endpoint.
+// tryAllCandidates tries the primary (segment[0] × revision[0]) first.
+// If that succeeds, return immediately. Otherwise probe all other
+// combinations concurrently and return the first success.
+func (d *ModelScope) tryAllCandidates(
+	ctx context.Context,
+	probe func(ctx context.Context, segment, revision string) ([]model.Obj, bool),
+) ([]model.Obj, error) {
+	segments := d.resourceSegmentsCandidates()
+	revisions := d.revisionCandidates()
+
+	// Fast path: primary candidate
+	if result, ok := probe(ctx, segments[0], revisions[0]); ok {
+		return result, nil
+	}
+
+	// Probe alternatives concurrently
+	var (
+		mu     sync.Mutex
+		result []model.Obj
+		found  bool
+	)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, seg := range segments {
+		for _, rev := range revisions {
+			if seg == segments[0] && rev == revisions[0] {
+				continue // already tried
+			}
+			wg.Add(1)
+			go func(segment, revision string) {
+				defer wg.Done()
+				if r, ok := probe(ctx, segment, revision); ok {
+					mu.Lock()
+					if !found {
+						result = r
+						found = true
+						cancel()
+					}
+					mu.Unlock()
+				}
+			}(seg, rev)
+		}
+	}
+	wg.Wait()
+
+	if found {
+		return result, nil
+	}
+	return nil, fmt.Errorf("modelscope list failed with all strategies")
+}
+
+// tryAllLinkCandidates is the Link variant of tryAllCandidates.
+func (d *ModelScope) tryAllLinkCandidates(
+	ctx context.Context,
+	probe func(ctx context.Context, segment, revision string) (*model.Link, bool),
+) (*model.Link, error) {
+	segments := d.resourceSegmentsCandidates()
+	revisions := d.revisionCandidates()
+
+	// Fast path: primary candidate
+	if link, ok := probe(ctx, segments[0], revisions[0]); ok {
+		return link, nil
+	}
+
+	// Probe alternatives concurrently
+	var (
+		mu     sync.Mutex
+		result *model.Link
+		found  bool
+	)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, seg := range segments {
+		for _, rev := range revisions {
+			if seg == segments[0] && rev == revisions[0] {
+				continue
+			}
+			wg.Add(1)
+			go func(segment, revision string) {
+				defer wg.Done()
+				if link, ok := probe(ctx, segment, revision); ok {
+					mu.Lock()
+					if !found {
+						result = link
+						found = true
+						cancel()
+					}
+					mu.Unlock()
+				}
+			}(seg, rev)
+		}
+	}
+	wg.Wait()
+
+	if found {
+		return result, nil
+	}
+	return nil, fmt.Errorf("modelscope link failed with all strategies")
+}
+
 func (d *ModelScope) listDatasetTree(ctx context.Context, relPath string) ([]model.Obj, error) {
-	// Normalize to repo-relative path (trim mount root / ModelID prefix)
 	raw := strings.TrimSpace(relPath)
 	root := strings.Trim(d.GetRootPath(), "/")
 	path := strings.TrimPrefix(raw, "/")
@@ -321,61 +348,35 @@ func (d *ModelScope) listDatasetTree(ctx context.Context, relPath string) ([]mod
 
 	utils.Log.Infof("ModelScope dataset list: relPath='%s' root='%s' normalizedPath='%s'", relPath, root, path)
 
-	segments := d.resourceSegmentsCandidates()
-	encodedPath := neturl.QueryEscape(path)
-	var lastErr error
-	for _, seg := range segments {
-		for idx, revision := range d.revisionCandidates() {
-			// Try both Root and Path parameter names; Root first (observed effective on many datasets)
-			for _, paramName := range []string{"Root", "Path"} {
-				apiURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/tree?Revision=%s&%s=%s&PageNumber=1&PageSize=1000", apiEndpoint, seg, d.ModelID, revision, paramName, encodedPath)
-				utils.Log.Infof("ModelScope Tree API URL: %s (param=%s, try %d)", apiURL, paramName, idx+1)
-				resp, err := d.client.R().SetContext(ctx).Get(apiURL)
-				if err != nil {
-					utils.Log.Errorf("modelscope tree api request error: %+v", err)
-					lastErr = err
-					continue
+	return d.tryAllCandidates(ctx, func(ctx context.Context, segment, revision string) ([]model.Obj, bool) {
+		encodedPath := neturl.QueryEscape(path)
+		for _, paramName := range []string{"Root", "Path"} {
+			apiURL := fmt.Sprintf("%s/api/v1/%s/%s/repo/tree?Revision=%s&%s=%s&PageNumber=1&PageSize=1000", apiEndpoint, segment, d.ModelID, revision, paramName, encodedPath)
+			resp, err := d.client.R().SetContext(ctx).Get(apiURL)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, false
 				}
-				if resp.StatusCode() != http.StatusOK {
-					utils.Log.Errorf("modelscope tree api status error: %d, body: %s", resp.StatusCode(), string(resp.Body()))
-					lastErr = fmt.Errorf("failed to list files: status code %d", resp.StatusCode())
-					continue
-				}
-				var fileListResp FileListResponse
-				if err := json.Unmarshal(resp.Body(), &fileListResp); err != nil {
-					utils.Log.Errorf("modelscope tree api unmarshal error: %+v", err)
-					utils.Log.Errorf("modelscope tree api response body: %s", string(resp.Body()))
-					lastErr = err
-					continue
-				}
-				// Accept either Success==true or Code==200
-				if !fileListResp.Success && fileListResp.Code != 200 {
-					utils.Log.Errorf("modelscope tree api logic error: %s (RequestId: %s, Code: %d)", fileListResp.Message, fileListResp.RequestID, fileListResp.Code)
-					lastErr = fmt.Errorf("modelscope api error: %s", fileListResp.Message)
-					continue
-				}
-				utils.Log.Infof("ModelScope dataset tree entries: %d (path='%s', param=%s)", len(fileListResp.Data.Files), path, paramName)
-				// log up to first 5 entries for debugging
-				max := 5
-				if len(fileListResp.Data.Files) < max {
-					max = len(fileListResp.Data.Files)
-				}
-				for i := 0; i < max; i++ {
-					utils.Log.Infof(" - %s (%s)", fileListResp.Data.Files[i].Name, fileListResp.Data.Files[i].Type)
-				}
-				return d.datasetFilesToObjs(fileListResp.Data.Files, path), nil
+				continue
 			}
+			if resp.StatusCode() != http.StatusOK {
+				continue
+			}
+			var filesResp FileListResponse
+			if uerr := json.Unmarshal(resp.Body(), &filesResp); uerr != nil {
+				continue
+			}
+			if !filesResp.Success && filesResp.Code != 200 {
+				continue
+			}
+			return d.datasetFilesToObjs(filesResp.Data.Files, path), true
 		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("modelscope dataset tree failed with all candidates")
-	}
-	return nil, lastErr
+		return nil, false
+	})
 }
 
 var _ driver.Driver = (*ModelScope)(nil)
 
-// datasetFilesToObjs constructs objects with driver-root absolute Path combining root and current relative path.
 func (d *ModelScope) datasetFilesToObjs(files []File, currentRelPath string) []model.Obj {
 	objects := make([]model.Obj, 0, len(files))
 	for _, f := range files {
@@ -386,7 +387,7 @@ func (d *ModelScope) datasetFilesToObjs(files []File, currentRelPath string) []m
 		}
 		objects = append(objects, &model.Object{
 			Name:     f.Name,
-			Path:     childRel, // keep repo-relative path for consistent navigation
+			Path:     childRel,
 			Size:     f.Size,
 			Modified: time.Unix(f.CommittedDate, 0),
 			IsFolder: isDir,
@@ -395,7 +396,6 @@ func (d *ModelScope) datasetFilesToObjs(files []File, currentRelPath string) []m
 	return objects
 }
 
-// repoRelativePath trims the driver root prefix (ModelID) to produce repo-relative path used by ModelScope APIs.
 func (d *ModelScope) repoRelativePath(p string) string {
 	raw := strings.TrimSpace(p)
 	root := strings.Trim(d.GetRootPath(), "/")
